@@ -1,0 +1,6 @@
+shiny>=1.8,<2
+shinywidgets>=0.8,<1
+pandas>=2.2,<4
+numpy>=2.0,<3
+plotly>=6.0,<7
+rsconnect-python>=1.26,<2

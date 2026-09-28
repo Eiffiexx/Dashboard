@@ -1,0 +1,7 @@
+git init
+git add .
+git status
+git commit -m "Build initial dashboard prototype"
+git branch -M main
+git remote add origin https://github.com/Eiffiexx/Dashboard.git
+git push -u origin main
