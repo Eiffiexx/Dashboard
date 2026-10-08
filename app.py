@@ -11,6 +11,7 @@ from plotly.subplots import make_subplots
 from shiny import App, Inputs, Outputs, Session, reactive, render, ui
 from shinywidgets import output_widget, render_widget
 
+from api_client import api_config_from_env, fetch_index_data
 from data_utils import (
     MAIN_INDICES,
     build_summary_metrics,
@@ -21,6 +22,8 @@ from data_utils import (
     load_index_data,
     make_sample_data,
     monthly_return_table,
+    ordered_index_names,
+    sort_by_index_order,
 )
 
 
@@ -44,16 +47,27 @@ PLOTLY_COLORS = [
 ]
 
 
-def load_default_data() -> tuple[pd.DataFrame, str]:
+def load_default_data() -> tuple[pd.DataFrame, str, str]:
+    """Load API data first, then local CSV, and finally safe demo data."""
+
+    api_error = ""
+    try:
+        config = api_config_from_env()
+        if config.enabled:
+            loaded = fetch_index_data(config)
+            return loaded, "Live API", ""
+    except Exception as exc:
+        api_error = str(exc)
+
     if DEFAULT_DATA_PATH.exists():
-        return load_index_data(DEFAULT_DATA_PATH), DEFAULT_DATA_PATH.name
-    return make_sample_data(), "Demo data"
+        return load_index_data(DEFAULT_DATA_PATH), DEFAULT_DATA_PATH.name, api_error
+    return make_sample_data(), "Demo data", api_error
 
 
-INITIAL_DATA, INITIAL_SOURCE = load_default_data()
+INITIAL_DATA, INITIAL_SOURCE, INITIAL_API_ERROR = load_default_data()
 INITIAL_INDICES = [name for name in MAIN_INDICES if name in INITIAL_DATA["type"].unique()]
 if not INITIAL_INDICES:
-    INITIAL_INDICES = sorted(INITIAL_DATA["type"].unique())[:5]
+    INITIAL_INDICES = ordered_index_names(INITIAL_DATA["type"].unique())[:5]
 
 
 def chart_layout(fig: go.Figure, *, height: int = 410, legend: bool = True) -> go.Figure:
@@ -108,10 +122,16 @@ sidebar = ui.sidebar(
         placeholder="Using bundled data",
     ),
     ui.output_ui("source_status"),
+    ui.input_action_button(
+        "refresh_api",
+        "Refresh API data",
+        class_="btn btn-outline-primary w-100",
+    ),
+    ui.output_ui("api_status"),
     ui.input_selectize(
         "indices",
         "Compare indices",
-        choices=sorted(INITIAL_DATA["type"].unique()),
+        choices=ordered_index_names(INITIAL_DATA["type"].unique()),
         selected=INITIAL_INDICES,
         multiple=True,
         remove_button=True,
@@ -127,7 +147,7 @@ sidebar = ui.sidebar(
     ui.input_select(
         "detail_index",
         "Index detail",
-        choices=sorted(INITIAL_DATA["type"].unique()),
+        choices=ordered_index_names(INITIAL_DATA["type"].unique()),
         selected=INITIAL_INDICES[0],
     ),
     ui.hr(),
@@ -268,6 +288,38 @@ app_ui = ui.page_sidebar(
 def server(input: Inputs, output: Outputs, session: Session):
     data_state = reactive.value(INITIAL_DATA)
     source_state = reactive.value(INITIAL_SOURCE)
+    api_error_state = reactive.value(INITIAL_API_ERROR)
+
+    def refresh_from_api(*, notify: bool = True) -> None:
+        try:
+            config = api_config_from_env()
+            if not config.enabled:
+                raise ValueError(
+                    "API is not configured. Copy .env.example to .env and add the endpoint and credentials."
+                )
+            loaded = fetch_index_data(config)
+            data_state.set(loaded)
+            source_state.set("Live API")
+            api_error_state.set("")
+            if notify:
+                ui.notification_show(
+                    f"Loaded {len(loaded):,} rows from the API",
+                    type="message",
+                    duration=5,
+                )
+        except Exception as exc:
+            api_error_state.set(str(exc))
+            if notify:
+                ui.notification_show(
+                    f"Could not refresh API data: {exc}",
+                    type="error",
+                    duration=10,
+                )
+
+    @reactive.effect
+    @reactive.event(input.refresh_api)
+    def refresh_api_data():
+        refresh_from_api()
 
     @reactive.effect
     @reactive.event(input.data_file)
@@ -282,6 +334,7 @@ def server(input: Inputs, output: Outputs, session: Session):
                 raise ValueError("The uploaded CSV contains no valid rows.")
             data_state.set(loaded)
             source_state.set(uploaded["name"])
+            api_error_state.set("")
             ui.notification_show(
                 f"Loaded {len(loaded):,} rows from {uploaded['name']}",
                 type="message",
@@ -297,7 +350,7 @@ def server(input: Inputs, output: Outputs, session: Session):
     @reactive.effect
     def refresh_filter_choices():
         df = data_state()
-        available = sorted(df["type"].unique())
+        available = ordered_index_names(df["type"].unique())
         preferred = [name for name in MAIN_INDICES if name in available]
         selected = preferred or available[:5]
         ui.update_selectize("indices", choices=available, selected=selected, server=True)
@@ -320,11 +373,13 @@ def server(input: Inputs, output: Outputs, session: Session):
         if date_range and len(date_range) == 2:
             start, end = pd.Timestamp(date_range[0]), pd.Timestamp(date_range[1])
             df = df[(df["date"] >= start) & (df["date"] <= end)]
-        return df.sort_values(["type", "date"])
+        order = {name: position for position, name in enumerate(ordered_index_names(df["type"].unique()))}
+        df["__index_order"] = df["type"].map(order).fillna(len(order))
+        return df.sort_values(["__index_order", "date"]).drop(columns="__index_order")
 
     @reactive.calc
     def summary() -> pd.DataFrame:
-        return build_summary_metrics(filtered_data())
+        return sort_by_index_order(build_summary_metrics(filtered_data()))
 
     @reactive.calc
     def detail_group() -> pd.DataFrame:
@@ -354,6 +409,21 @@ def server(input: Inputs, output: Outputs, session: Session):
             ui.span(source_state()),
             class_="source-status",
         )
+
+    @render.ui
+    def api_status():
+        error = api_error_state()
+        if error:
+            return ui.p(f"API: {error}", class_="sidebar-help text-danger")
+        if source_state() == "Live API":
+            return ui.p("API connection active", class_="sidebar-help text-success")
+        try:
+            configured = api_config_from_env().enabled
+        except Exception:
+            configured = False
+        if configured:
+            return ui.p("API configured; click refresh to load the latest data.", class_="sidebar-help")
+        return ui.p("API not configured; CSV upload remains available.", class_="sidebar-help")
 
     @render.text
     def as_of_label():
@@ -393,7 +463,8 @@ def server(input: Inputs, output: Outputs, session: Session):
         if df.empty:
             return empty_figure("No data in the selected range")
         frames = []
-        for index_name, group in df.groupby("type"):
+        for index_name in ordered_index_names(df["type"].unique()):
+            group = df[df["type"] == index_name]
             group = group.sort_values("date").copy()
             group["Cumulative index"] = (1 + group["ror"]).cumprod() * 100
             group["Index"] = index_name
@@ -585,6 +656,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             y="cnt",
             color="type",
             color_discrete_sequence=PLOTLY_COLORS,
+            category_orders={"type": ordered_index_names(df["type"].unique())},
         )
         fig.update_traces(line=dict(width=2))
         fig.update_xaxes(title=None)
@@ -602,6 +674,7 @@ def server(input: Inputs, output: Outputs, session: Session):
             y="aumbn",
             color="type",
             color_discrete_sequence=PLOTLY_COLORS,
+            category_orders={"type": ordered_index_names(df["type"].unique())},
         )
         fig.update_traces(line=dict(width=2))
         fig.update_xaxes(title=None)
@@ -650,3 +723,4 @@ if __name__ == "__main__":
     # Allows app.py to be run directly from PyCharm.
     # For automatic reload while editing, use: shiny run --reload app.py
     app.run(host="127.0.0.1", port=8000)
+w

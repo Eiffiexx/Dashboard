@@ -5,3 +5,6 @@ __pycache__/
 .DS_Store
 data/*.csv
 !data/.gitkeep
+.env
+.env.*
+!.env.example
