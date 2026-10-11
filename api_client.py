@@ -1,10 +1,3 @@
-"""Secure, configurable data ingestion for the NilssonHedge dashboard.
-
-The module deliberately keeps credentials out of source code. Configure the
-connection with environment variables (or a local ``.env`` file) and never
-commit real credentials or confidential data to Git.
-"""
-
 from __future__ import annotations
 
 import io

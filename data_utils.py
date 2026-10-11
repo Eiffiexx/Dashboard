@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +26,36 @@ COLUMN_ALIASES = {
 }
 REQUIRED_COLUMNS = {"date", "ror", "type"}
 MAIN_INDICES = ["CTA", "Crypto", "Equity LS", "Market Neutral", "Risk Parity"]
+
+
+def configured_index_order() -> list[str]:
+    """Return the preferred index display order.
+
+    Linus can provide the final order through ``NH_INDEX_ORDER`` without a
+    code change. Any index not listed there is appended alphabetically.
+    """
+
+    configured = os.getenv("NH_INDEX_ORDER", "").strip()
+    if not configured:
+        return MAIN_INDICES.copy()
+    return [name.strip() for name in configured.split(",") if name.strip()]
+
+
+def ordered_index_names(values) -> list[str]:
+    available = {str(value).strip() for value in values if str(value).strip()}
+    preferred = [name for name in configured_index_order() if name in available]
+    remaining = sorted(available.difference(preferred), key=str.casefold)
+    return preferred + remaining
+
+
+def sort_by_index_order(df: pd.DataFrame, column: str = "Index") -> pd.DataFrame:
+    if df.empty or column not in df.columns:
+        return df
+    order = ordered_index_names(df[column].dropna().unique())
+    ranking = {name: position for position, name in enumerate(order)}
+    result = df.copy()
+    result["__index_order"] = result[column].map(ranking).fillna(len(ranking))
+    return result.sort_values(["__index_order", column]).drop(columns="__index_order").reset_index(drop=True)
 
 
 def normalize_column_name(column_name: str) -> str:
@@ -119,6 +150,58 @@ def annualized_volatility(returns: pd.Series) -> float:
 def drawdown_series(returns: pd.Series) -> pd.Series:
     cumulative = (1 + returns.fillna(0)).cumprod()
     return cumulative / cumulative.cummax() - 1
+
+
+def build_performance_cone(
+    group: pd.DataFrame,
+    *,
+    target_sharpe: float = 1.0,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Build a compounded performance cone for one monthly index series.
+
+    The actual index is compounded from simple monthly returns. The expected
+    path assumes a configurable Sharpe ratio and the index's own realized
+    annualized log-return volatility. Dispersion grows with ``sqrt(time)``.
+    """
+
+    ordered = group.sort_values("date").dropna(subset=["date", "ror"]).copy()
+    ordered = ordered[ordered["ror"] > -1]
+    if ordered.empty:
+        return pd.DataFrame(), {
+            "annualized_volatility": math.nan,
+            "expected_annual_return": math.nan,
+            "target_sharpe": target_sharpe,
+        }
+
+    log_returns = np.log1p(ordered["ror"].astype(float))
+    annualized_log_volatility = (
+        float(log_returns.std(ddof=1) * math.sqrt(12))
+        if len(log_returns) >= 2
+        else 0.0
+    )
+    expected_log_growth = float(target_sharpe * annualized_log_volatility)
+    expected_annual_return = math.expm1(expected_log_growth)
+
+    elapsed_years = np.arange(1, len(ordered) + 1, dtype=float) / 12.0
+    expected_log_index = expected_log_growth * elapsed_years
+    dispersion = annualized_log_volatility * np.sqrt(elapsed_years)
+
+    cone = pd.DataFrame(
+        {
+            "date": ordered["date"].to_numpy(),
+            "Actual": 100.0 * np.exp(log_returns.cumsum().to_numpy()),
+            "Expected": 100.0 * np.exp(expected_log_index),
+            "Upper 1σ": 100.0 * np.exp(expected_log_index + dispersion),
+            "Lower 1σ": 100.0 * np.exp(expected_log_index - dispersion),
+            "Upper 2σ": 100.0 * np.exp(expected_log_index + 2.0 * dispersion),
+            "Lower 2σ": 100.0 * np.exp(expected_log_index - 2.0 * dispersion),
+        }
+    )
+    return cone, {
+        "annualized_volatility": annualized_log_volatility,
+        "expected_annual_return": expected_annual_return,
+        "target_sharpe": float(target_sharpe),
+    }
 
 
 def max_drawdown(returns: pd.Series) -> float:
@@ -251,9 +334,10 @@ def monthly_return_table(group: pd.DataFrame) -> pd.DataFrame:
         "Dec",
     ]
     ytd = group.groupby("year")["ror"].apply(cumulative_return)
-    managers = group.groupby("year")["cnt"].mean()
     table["YTD"] = ytd
-    table["Avg managers"] = managers
+    include_managers = group["cnt"].notna().any()
+    if include_managers:
+        table["Avg managers"] = group.groupby("year")["cnt"].mean()
     table = table.sort_index(ascending=False).reset_index().rename(columns={"year": "Year"})
 
     for column in [
@@ -272,7 +356,8 @@ def monthly_return_table(group: pd.DataFrame) -> pd.DataFrame:
         "YTD",
     ]:
         table[column] = table[column].map(format_percent)
-    table["Avg managers"] = table["Avg managers"].map(format_number)
+    if include_managers:
+        table["Avg managers"] = table["Avg managers"].map(format_number)
     return table
 
 
